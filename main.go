@@ -375,7 +375,7 @@ func (e *Engine) applyPosition(fields []string) error {
 }
 
 func parseGo(fields []string) SearchLimits {
-	limits := SearchLimits{Depth: 6}
+	limits := SearchLimits{Depth: 64}
 	for i := 0; i < len(fields); i++ {
 		tok := fields[i]
 		switch tok {
@@ -1069,7 +1069,7 @@ func (s *Searcher) searchBestMove(ctx context.Context, pos Position, limits Sear
 
 	maxDepth := limits.Depth
 	if maxDepth <= 0 {
-		maxDepth = 6
+		maxDepth = 64
 	}
 	deadline := computeDeadline(pos.sideToMove, limits)
 	s.nodes = 0
