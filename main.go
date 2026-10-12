@@ -30,6 +30,13 @@ const (
 	castleBQ = 1 << 3
 
 	mateScore = 100000
+	maxPly    = 64
+
+	ttFlagExact = 0
+	ttFlagLower = 1
+	ttFlagUpper = 2
+
+	maxHistoryScore = 16384
 )
 
 type Move struct {
@@ -38,6 +45,7 @@ type Move struct {
 	Promo     int
 	EnPassant bool
 	Castle    bool
+	Captured  int
 }
 
 type Undo struct {
@@ -46,6 +54,8 @@ type Undo struct {
 	epSquare       int
 	halfmove       int
 	fullmove       int
+	hash           uint64
+	kingSq         [2]int
 }
 
 type Position struct {
@@ -55,6 +65,8 @@ type Position struct {
 	epSquare       int
 	halfmove       int
 	fullmove       int
+	hash           uint64
+	kingSq         [2]int
 }
 
 type SearchLimits struct {
@@ -63,6 +75,7 @@ type SearchLimits struct {
 	Infinite bool
 	WTime    time.Duration
 	BTime    time.Duration
+	Silent   bool
 }
 
 type Engine struct {
@@ -73,13 +86,62 @@ type Engine struct {
 	wg     sync.WaitGroup
 }
 
-var (
-	knightOffsets = []int{17, 15, 10, 6, -17, -15, -10, -6}
-	bishopDirs    = []int{9, 7, -9, -7}
-	rookDirs      = []int{8, -8, 1, -1}
-	kingOffsets   = []int{8, -8, 1, -1, 9, 7, -9, -7}
+type MoveList struct {
+	moves [256]Move
+	count int
+}
 
-	pieceValues = map[int]int{pawn: 100, knight: 320, bishop: 330, rook: 500, queen: 900, king: 0}
+func (ml *MoveList) reset() {
+	ml.count = 0
+}
+
+func (ml *MoveList) add(m Move) {
+	ml.moves[ml.count] = m
+	ml.count++
+}
+
+type TTEntry struct {
+	key   uint64
+	move  Move
+	score int
+	depth int8
+	flag  uint8
+	age   uint8
+}
+
+type Searcher struct {
+	tt       []TTEntry
+	age      uint8
+	nodes    uint64
+	history  [2][64][64]int
+	killers  [maxPly][2]Move
+	repeat   [maxPly + 256]uint64
+	repCount int
+}
+
+var globalSearcher = newSearcher(1 << 20)
+
+var (
+	knightOffsets = [8]int{17, 15, 10, 6, -17, -15, -10, -6}
+	bishopDirs    = [4]int{9, 7, -9, -7}
+	rookDirs      = [4]int{8, -8, 1, -1}
+	queenDirs     = [8]int{9, 7, -9, -7, 8, -8, 1, -1}
+	kingOffsets   = [8]int{8, -8, 1, -1, 9, 7, -9, -7}
+
+	pieceValues = [7]int{0, 100, 320, 330, 500, 900, 0}
+	promoPieces = [4]int{queen, rook, bishop, knight}
+
+	knightAttacks [64][8]int
+	knightCount   [64]int
+	kingAttacks   [64][8]int
+	kingCount     [64]int
+	pawnAttacks   [2][64][2]int
+	pawnCount     [2][64]int
+
+	zobristPiece    [12][64]uint64
+	zobristCastling [16]uint64
+	zobristEPFile   [9]uint64
+	zobristSide     uint64
 
 	pstPawn = [64]int{
 		0, 0, 0, 0, 0, 0, 0, 0,
@@ -142,6 +204,81 @@ var (
 		20, 30, 10, 0, 0, 10, 30, 20,
 	}
 )
+
+func init() {
+	initAttackTables()
+	initZobrist()
+}
+
+func initAttackTables() {
+	for sq := 0; sq < 64; sq++ {
+		for _, off := range knightOffsets {
+			to := sq + off
+			if inBoard(to) && sameKnightPattern(sq, to) {
+				knightAttacks[sq][knightCount[sq]] = to
+				knightCount[sq]++
+			}
+		}
+		for _, off := range kingOffsets {
+			to := sq + off
+			if inBoard(to) && sameKingPattern(sq, to) {
+				kingAttacks[sq][kingCount[sq]] = to
+				kingCount[sq]++
+			}
+		}
+		file := sq % 8
+		if file > 0 {
+			pawnAttacks[0][sq][pawnCount[0][sq]] = sq + 7
+			pawnCount[0][sq]++
+		}
+		if file < 7 {
+			pawnAttacks[0][sq][pawnCount[0][sq]] = sq + 9
+			pawnCount[0][sq]++
+		}
+		if file > 0 {
+			pawnAttacks[1][sq][pawnCount[1][sq]] = sq - 9
+			pawnCount[1][sq]++
+		}
+		if file < 7 {
+			pawnAttacks[1][sq][pawnCount[1][sq]] = sq - 7
+			pawnCount[1][sq]++
+		}
+	}
+}
+
+func initZobrist() {
+	var x uint64 = 0x9e3779b97f4a7c15
+	next := func() uint64 {
+		x ^= x >> 12
+		x ^= x << 25
+		x ^= x >> 27
+		return x * 2685821657736338717
+	}
+	for i := range zobristPiece {
+		for j := 0; j < 64; j++ {
+			zobristPiece[i][j] = next()
+		}
+	}
+	for i := 0; i < 16; i++ {
+		zobristCastling[i] = next()
+	}
+	for i := 0; i < 9; i++ {
+		zobristEPFile[i] = next()
+	}
+	zobristSide = next()
+}
+
+func newSearcher(ttSize int) *Searcher {
+	if ttSize < 1 {
+		ttSize = 1 << 20
+	}
+	// Keep table size power of two for fast masking.
+	size := 1
+	for size < ttSize {
+		size <<= 1
+	}
+	return &Searcher{tt: make([]TTEntry, size)}
+}
 
 func main() {
 	engine := &Engine{pos: NewStartPosition()}
@@ -324,6 +461,8 @@ func NewStartPosition() Position {
 func NewPositionFromFEN(fen string) (Position, error) {
 	var p Position
 	p.epSquare = -1
+	p.kingSq[0] = -1
+	p.kingSq[1] = -1
 	parts := strings.Fields(fen)
 	if len(parts) != 6 {
 		return p, fmt.Errorf("invalid fen field count")
@@ -350,6 +489,11 @@ func NewPositionFromFEN(fen string) (Position, error) {
 				return p, fmt.Errorf("invalid fen piece")
 			}
 			p.board[sq] = piece
+			if piece == king {
+				p.kingSq[0] = sq
+			} else if piece == -king {
+				p.kingSq[1] = sq
+			}
 			file++
 		}
 		if file != 8 {
@@ -397,6 +541,7 @@ func NewPositionFromFEN(fen string) (Position, error) {
 	if p.fullmove == 0 {
 		p.fullmove = 1
 	}
+	p.hash = p.computeHash()
 
 	return p, nil
 }
@@ -437,7 +582,15 @@ func (p Position) Clone() Position {
 }
 
 func (p *Position) MakeMove(m Move) Undo {
-	undo := Undo{captured: p.board[m.To], castlingRights: p.castlingRights, epSquare: p.epSquare, halfmove: p.halfmove, fullmove: p.fullmove}
+	undo := Undo{
+		captured:       p.board[m.To],
+		castlingRights: p.castlingRights,
+		epSquare:       p.epSquare,
+		halfmove:       p.halfmove,
+		fullmove:       p.fullmove,
+		hash:           p.hash,
+		kingSq:         p.kingSq,
+	}
 	piece := p.board[m.From]
 	movingType := abs(piece)
 
@@ -451,34 +604,49 @@ func (p *Position) MakeMove(m Move) Undo {
 		p.fullmove++
 	}
 
+	p.hash ^= zobristCastling[p.castlingRights]
+	p.hash ^= zobristEPFile[epFileIndex(undo.epSquare)]
+	p.hash ^= zobristPiece[pieceToHashIndex(piece)][m.From]
 	p.board[m.From] = empty
 
 	if m.EnPassant {
 		if p.sideToMove == white {
 			capSq := m.To - 8
 			undo.captured = p.board[capSq]
+			p.hash ^= zobristPiece[pieceToHashIndex(undo.captured)][capSq]
 			p.board[capSq] = empty
 		} else {
 			capSq := m.To + 8
 			undo.captured = p.board[capSq]
+			p.hash ^= zobristPiece[pieceToHashIndex(undo.captured)][capSq]
 			p.board[capSq] = empty
 		}
+	} else if undo.captured != empty {
+		p.hash ^= zobristPiece[pieceToHashIndex(undo.captured)][m.To]
 	}
 
 	if m.Castle {
 		switch m.To {
 		case 6:
+			p.hash ^= zobristPiece[pieceToHashIndex(p.board[7])][7]
 			p.board[5] = p.board[7]
 			p.board[7] = empty
+			p.hash ^= zobristPiece[pieceToHashIndex(p.board[5])][5]
 		case 2:
+			p.hash ^= zobristPiece[pieceToHashIndex(p.board[0])][0]
 			p.board[3] = p.board[0]
 			p.board[0] = empty
+			p.hash ^= zobristPiece[pieceToHashIndex(p.board[3])][3]
 		case 62:
+			p.hash ^= zobristPiece[pieceToHashIndex(p.board[63])][63]
 			p.board[61] = p.board[63]
 			p.board[63] = empty
+			p.hash ^= zobristPiece[pieceToHashIndex(p.board[61])][61]
 		case 58:
+			p.hash ^= zobristPiece[pieceToHashIndex(p.board[56])][56]
 			p.board[59] = p.board[56]
 			p.board[56] = empty
+			p.hash ^= zobristPiece[pieceToHashIndex(p.board[59])][59]
 		}
 	}
 
@@ -490,6 +658,7 @@ func (p *Position) MakeMove(m Move) Undo {
 		}
 	}
 	p.board[m.To] = piece
+	p.hash ^= zobristPiece[pieceToHashIndex(piece)][m.To]
 
 	if movingType == pawn && abs(m.To-m.From) == 16 {
 		if p.sideToMove == white {
@@ -499,15 +668,32 @@ func (p *Position) MakeMove(m Move) Undo {
 		}
 	}
 
+	if movingType == king {
+		if p.sideToMove == white {
+			p.kingSq[0] = m.To
+		} else {
+			p.kingSq[1] = m.To
+		}
+	}
+
 	p.updateCastlingRights(m, movingType, undo.captured)
+	p.hash ^= zobristCastling[p.castlingRights]
+	p.hash ^= zobristEPFile[epFileIndex(p.epSquare)]
+	p.hash ^= zobristSide
 	p.sideToMove = -p.sideToMove
 	return undo
 }
 
 func (p *Position) UndoMove(m Move, u Undo) {
 	p.sideToMove = -p.sideToMove
-	piece := p.board[m.To]
+	p.castlingRights = u.castlingRights
+	p.epSquare = u.epSquare
+	p.halfmove = u.halfmove
+	p.fullmove = u.fullmove
+	p.hash = u.hash
+	p.kingSq = u.kingSq
 
+	piece := p.board[m.To]
 	if m.Promo != 0 {
 		if p.sideToMove == white {
 			piece = pawn
@@ -515,22 +701,16 @@ func (p *Position) UndoMove(m Move, u Undo) {
 			piece = -pawn
 		}
 	}
-
 	p.board[m.From] = piece
 	p.board[m.To] = u.captured
-
 	if m.EnPassant {
+		p.board[m.To] = empty
 		if p.sideToMove == white {
-			capSq := m.To - 8
-			p.board[m.To] = empty
-			p.board[capSq] = -pawn
+			p.board[m.To-8] = -pawn
 		} else {
-			capSq := m.To + 8
-			p.board[m.To] = empty
-			p.board[capSq] = pawn
+			p.board[m.To+8] = pawn
 		}
 	}
-
 	if m.Castle {
 		switch m.To {
 		case 6:
@@ -548,10 +728,37 @@ func (p *Position) UndoMove(m Move, u Undo) {
 		}
 	}
 
+}
+
+func (p *Position) MakeNullMove() Undo {
+	u := Undo{
+		castlingRights: p.castlingRights,
+		epSquare:       p.epSquare,
+		halfmove:       p.halfmove,
+		fullmove:       p.fullmove,
+		hash:           p.hash,
+		kingSq:         p.kingSq,
+	}
+	p.hash ^= zobristEPFile[epFileIndex(p.epSquare)]
+	p.epSquare = -1
+	p.hash ^= zobristEPFile[0]
+	p.hash ^= zobristSide
+	if p.sideToMove == black {
+		p.fullmove++
+	}
+	p.halfmove++
+	p.sideToMove = -p.sideToMove
+	return u
+}
+
+func (p *Position) UndoNullMove(u Undo) {
+	p.sideToMove = -p.sideToMove
 	p.castlingRights = u.castlingRights
 	p.epSquare = u.epSquare
 	p.halfmove = u.halfmove
 	p.fullmove = u.fullmove
+	p.hash = u.hash
+	p.kingSq = u.kingSq
 }
 
 func (p *Position) updateCastlingRights(m Move, movingType int, captured int) {
@@ -593,113 +800,124 @@ func (p *Position) updateCastlingRights(m Move, movingType int, captured int) {
 }
 
 func (p Position) GenerateLegalMoves() []Move {
-	pseudo := p.generatePseudoMoves()
-	moves := make([]Move, 0, len(pseudo))
-	for _, m := range pseudo {
-		cp := p
-		u := cp.MakeMove(m)
-		if !cp.InCheck(-cp.sideToMove) {
-			moves = append(moves, m)
-		}
-		cp.UndoMove(m, u)
-	}
+	cp := p
+	var list MoveList
+	cp.generateLegalMovesTo(&list, false)
+	moves := make([]Move, list.count)
+	copy(moves, list.moves[:list.count])
 	return moves
 }
 
-func (p Position) generatePseudoMoves() []Move {
-	moves := make([]Move, 0, 64)
+func (p *Position) generateLegalMovesTo(legal *MoveList, capturesOnly bool) {
+	legal.reset()
+	var pseudo MoveList
+	p.generatePseudoMovesTo(&pseudo, capturesOnly)
+	for i := 0; i < pseudo.count; i++ {
+		m := pseudo.moves[i]
+		u := p.MakeMove(m)
+		if !p.InCheck(-p.sideToMove) {
+			legal.add(m)
+		}
+		p.UndoMove(m, u)
+	}
+}
+
+func (p *Position) generatePseudoMovesTo(moves *MoveList, capturesOnly bool) {
+	moves.reset()
 	for sq, piece := range p.board {
 		if piece == empty || colorOf(piece) != p.sideToMove {
 			continue
 		}
-		t := abs(piece)
-		switch t {
+		switch abs(piece) {
 		case pawn:
-			p.generatePawnMoves(sq, &moves)
+			p.generatePawnMoves(sq, capturesOnly, moves)
 		case knight:
-			p.generateKnightMoves(sq, &moves)
+			p.generateKnightMoves(sq, capturesOnly, moves)
 		case bishop:
-			p.generateSliderMoves(sq, bishopDirs, &moves)
+			p.generateSliderMoves(sq, bishopDirs[:], capturesOnly, moves)
 		case rook:
-			p.generateSliderMoves(sq, rookDirs, &moves)
+			p.generateSliderMoves(sq, rookDirs[:], capturesOnly, moves)
 		case queen:
-			p.generateSliderMoves(sq, bishopDirs, &moves)
-			p.generateSliderMoves(sq, rookDirs, &moves)
+			p.generateSliderMoves(sq, queenDirs[:], capturesOnly, moves)
 		case king:
-			p.generateKingMoves(sq, &moves)
+			p.generateKingMoves(sq, capturesOnly, moves)
 		}
 	}
-	return moves
 }
 
-func (p Position) generatePawnMoves(sq int, moves *[]Move) {
+func (p *Position) generatePawnMoves(sq int, capturesOnly bool, moves *MoveList) {
 	rank := sq / 8
 	file := sq % 8
 	dir := 8
 	startRank := 1
 	promoRank := 6
 	enemy := black
+	colorIdx := 0
 	if p.sideToMove == black {
 		dir = -8
 		startRank = 6
 		promoRank = 1
 		enemy = white
+		colorIdx = 1
 	}
 
-	one := sq + dir
-	if inBoard(one) && p.board[one] == empty {
-		if rank == promoRank {
-			for _, promo := range []int{queen, rook, bishop, knight} {
-				*moves = append(*moves, Move{From: sq, To: one, Promo: promo})
-			}
-		} else {
-			*moves = append(*moves, Move{From: sq, To: one})
-			if rank == startRank {
-				two := sq + 2*dir
-				if inBoard(two) && p.board[two] == empty {
-					*moves = append(*moves, Move{From: sq, To: two})
-				}
-			}
-		}
-	}
-
-	for _, df := range []int{-1, 1} {
-		nf := file + df
-		if nf < 0 || nf > 7 {
-			continue
-		}
-		to := sq + dir + df
-		if !inBoard(to) {
-			continue
-		}
-		if p.board[to] != empty && colorOf(p.board[to]) == enemy {
+	if !capturesOnly {
+		one := sq + dir
+		if inBoard(one) && p.board[one] == empty {
 			if rank == promoRank {
-				for _, promo := range []int{queen, rook, bishop, knight} {
-					*moves = append(*moves, Move{From: sq, To: to, Promo: promo})
+				for _, promo := range promoPieces {
+					moves.add(Move{From: sq, To: one, Promo: promo})
 				}
 			} else {
-				*moves = append(*moves, Move{From: sq, To: to})
+				moves.add(Move{From: sq, To: one})
+				if rank == startRank {
+					two := sq + 2*dir
+					if inBoard(two) && p.board[two] == empty {
+						moves.add(Move{From: sq, To: two})
+					}
+				}
+			}
+		}
+	}
+
+	for i := 0; i < pawnCount[colorIdx][sq]; i++ {
+		to := pawnAttacks[colorIdx][sq][i]
+		if !inBoard(to) || abs((to%8)-file) != 1 {
+			continue
+		}
+		target := p.board[to]
+		if target != empty && colorOf(target) == enemy {
+			if rank == promoRank {
+				for _, promo := range promoPieces {
+					moves.add(Move{From: sq, To: to, Promo: promo, Captured: target})
+				}
+			} else {
+				moves.add(Move{From: sq, To: to, Captured: target})
 			}
 		}
 		if to == p.epSquare {
-			*moves = append(*moves, Move{From: sq, To: to, EnPassant: true})
+			moves.add(Move{From: sq, To: to, EnPassant: true, Captured: -p.sideToMove * pawn})
 		}
 	}
 }
 
-func (p Position) generateKnightMoves(sq int, moves *[]Move) {
-	for _, off := range knightOffsets {
-		to := sq + off
-		if !inBoard(to) || !sameKnightPattern(sq, to) {
+func (p *Position) generateKnightMoves(sq int, capturesOnly bool, moves *MoveList) {
+	for i := 0; i < knightCount[sq]; i++ {
+		to := knightAttacks[sq][i]
+		target := p.board[to]
+		if target == empty {
+			if !capturesOnly {
+				moves.add(Move{From: sq, To: to})
+			}
 			continue
 		}
-		if p.board[to] == empty || colorOf(p.board[to]) != p.sideToMove {
-			*moves = append(*moves, Move{From: sq, To: to})
+		if colorOf(target) != p.sideToMove {
+			moves.add(Move{From: sq, To: to, Captured: target})
 		}
 	}
 }
 
-func (p Position) generateSliderMoves(sq int, dirs []int, moves *[]Move) {
+func (p *Position) generateSliderMoves(sq int, dirs []int, capturesOnly bool, moves *MoveList) {
 	for _, d := range dirs {
 		to := sq
 		for {
@@ -708,83 +926,86 @@ func (p Position) generateSliderMoves(sq int, dirs []int, moves *[]Move) {
 				break
 			}
 			to = next
-			if p.board[to] == empty {
-				*moves = append(*moves, Move{From: sq, To: to})
+			target := p.board[to]
+			if target == empty {
+				if !capturesOnly {
+					moves.add(Move{From: sq, To: to})
+				}
 				continue
 			}
-			if colorOf(p.board[to]) != p.sideToMove {
-				*moves = append(*moves, Move{From: sq, To: to})
+			if colorOf(target) != p.sideToMove {
+				moves.add(Move{From: sq, To: to, Captured: target})
 			}
 			break
 		}
 	}
 }
 
-func (p Position) generateKingMoves(sq int, moves *[]Move) {
-	for _, off := range kingOffsets {
-		to := sq + off
-		if !inBoard(to) || !sameKingPattern(sq, to) {
-			continue
-		}
-		if p.board[to] == empty || colorOf(p.board[to]) != p.sideToMove {
-			*moves = append(*moves, Move{From: sq, To: to})
+func (p *Position) generateKingMoves(sq int, capturesOnly bool, moves *MoveList) {
+	for i := 0; i < kingCount[sq]; i++ {
+		to := kingAttacks[sq][i]
+		target := p.board[to]
+		if target == empty {
+			if !capturesOnly {
+				moves.add(Move{From: sq, To: to})
+			}
+		} else if colorOf(target) != p.sideToMove {
+			moves.add(Move{From: sq, To: to, Captured: target})
 		}
 	}
-
+	if capturesOnly {
+		return
+	}
 	if p.sideToMove == white && sq == 4 {
 		if p.castlingRights&castleWK != 0 && p.board[5] == empty && p.board[6] == empty && !p.InCheck(white) && !p.squareAttacked(5, black) && !p.squareAttacked(6, black) {
-			*moves = append(*moves, Move{From: 4, To: 6, Castle: true})
+			moves.add(Move{From: 4, To: 6, Castle: true})
 		}
 		if p.castlingRights&castleWQ != 0 && p.board[3] == empty && p.board[2] == empty && p.board[1] == empty && !p.InCheck(white) && !p.squareAttacked(3, black) && !p.squareAttacked(2, black) {
-			*moves = append(*moves, Move{From: 4, To: 2, Castle: true})
+			moves.add(Move{From: 4, To: 2, Castle: true})
 		}
 	}
 	if p.sideToMove == black && sq == 60 {
 		if p.castlingRights&castleBK != 0 && p.board[61] == empty && p.board[62] == empty && !p.InCheck(black) && !p.squareAttacked(61, white) && !p.squareAttacked(62, white) {
-			*moves = append(*moves, Move{From: 60, To: 62, Castle: true})
+			moves.add(Move{From: 60, To: 62, Castle: true})
 		}
 		if p.castlingRights&castleBQ != 0 && p.board[59] == empty && p.board[58] == empty && p.board[57] == empty && !p.InCheck(black) && !p.squareAttacked(59, white) && !p.squareAttacked(58, white) {
-			*moves = append(*moves, Move{From: 60, To: 58, Castle: true})
+			moves.add(Move{From: 60, To: 58, Castle: true})
 		}
 	}
 }
 
 func (p Position) InCheck(color int) bool {
-	kingSq := -1
-	for sq, piece := range p.board {
-		if piece == color*king {
-			kingSq = sq
-			break
-		}
+	idx := 0
+	if color == black {
+		idx = 1
 	}
-	if kingSq == -1 {
+	kingSq := p.kingSq[idx]
+	if kingSq < 0 {
 		return false
 	}
 	return p.squareAttacked(kingSq, -color)
 }
 
 func (p Position) squareAttacked(sq int, byColor int) bool {
-	file := sq % 8
-
 	if byColor == white {
-		for _, off := range []int{-7, -9} {
-			from := sq + off
-			if inBoard(from) && abs((from%8)-file) == 1 && p.board[from] == pawn {
+		for i := 0; i < pawnCount[1][sq]; i++ {
+			from := pawnAttacks[1][sq][i]
+			if inBoard(from) && p.board[from] == pawn {
 				return true
 			}
 		}
 	} else {
-		for _, off := range []int{7, 9} {
-			from := sq + off
-			if inBoard(from) && abs((from%8)-file) == 1 && p.board[from] == -pawn {
+		for i := 0; i < pawnCount[0][sq]; i++ {
+			from := pawnAttacks[0][sq][i]
+			if inBoard(from) && p.board[from] == -pawn {
 				return true
 			}
 		}
 	}
 
-	for _, off := range knightOffsets {
-		from := sq + off
-		if inBoard(from) && sameKnightPattern(sq, from) && p.board[from] == byColor*knight {
+	for i := 0; i < knightCount[sq]; i++ {
+		from := knightAttacks[sq][i]
+		if p.board[from] == byColor*knight {
 			return true
 		}
 	}
@@ -807,7 +1028,6 @@ func (p Position) squareAttacked(sq int, byColor int) bool {
 			break
 		}
 	}
-
 	for _, d := range rookDirs {
 		cur := sq
 		for {
@@ -827,19 +1047,23 @@ func (p Position) squareAttacked(sq int, byColor int) bool {
 		}
 	}
 
-	for _, off := range kingOffsets {
-		from := sq + off
-		if inBoard(from) && sameKingPattern(sq, from) && p.board[from] == byColor*king {
+	for i := 0; i < kingCount[sq]; i++ {
+		from := kingAttacks[sq][i]
+		if p.board[from] == byColor*king {
 			return true
 		}
 	}
-
 	return false
 }
 
 func SearchBestMove(ctx context.Context, pos Position, limits SearchLimits) Move {
-	moves := pos.GenerateLegalMoves()
-	if len(moves) == 0 {
+	return globalSearcher.searchBestMove(ctx, pos, limits)
+}
+
+func (s *Searcher) searchBestMove(ctx context.Context, pos Position, limits SearchLimits) Move {
+	var rootMoves MoveList
+	pos.generateLegalMovesTo(&rootMoves, false)
+	if rootMoves.count == 0 {
 		return Move{From: -1, To: -1}
 	}
 
@@ -847,111 +1071,261 @@ func SearchBestMove(ctx context.Context, pos Position, limits SearchLimits) Move
 	if maxDepth <= 0 {
 		maxDepth = 6
 	}
-	deadline := time.Time{}
-	if limits.MoveTime > 0 {
-		deadline = time.Now().Add(limits.MoveTime)
-	} else if !limits.Infinite {
-		remaining := limits.WTime
-		if pos.sideToMove == black {
-			remaining = limits.BTime
-		}
-		if remaining > 0 {
-			budget := remaining / 30
-			if budget < 50*time.Millisecond {
-				budget = 50 * time.Millisecond
-			}
-			if budget > 2*time.Second {
-				budget = 2 * time.Second
-			}
-			deadline = time.Now().Add(budget)
-		}
-	}
+	deadline := computeDeadline(pos.sideToMove, limits)
+	s.nodes = 0
+	s.age++
+	s.repCount = 0
+	s.repeat[s.repCount] = pos.hash
+	s.repCount++
 
-	bestMove := moves[0]
-	bestScore := math.MinInt
+	bestMove := rootMoves.moves[0]
+	bestScore := -mateScore
+	aspiration := 30
+	alpha := -mateScore
+	beta := mateScore
+	start := time.Now()
 
 	for depth := 1; depth <= maxDepth; depth++ {
 		if searchStopped(ctx, deadline) {
 			break
 		}
-		score, move, complete := searchRoot(ctx, pos, depth, deadline)
-		if !complete {
+		if depth > 2 {
+			alpha = bestScore - aspiration
+			beta = bestScore + aspiration
+		} else {
+			alpha, beta = -mateScore, mateScore
+		}
+
+		var score int
+		var complete bool
+		for {
+			score, bestMove, complete = s.searchRoot(ctx, &pos, depth, alpha, beta, deadline)
+			if !complete {
+				return bestMove
+			}
+			if score <= alpha && depth > 2 {
+				alpha -= aspiration
+				aspiration *= 2
+				continue
+			}
+			if score >= beta && depth > 2 {
+				beta += aspiration
+				aspiration *= 2
+				continue
+			}
 			break
 		}
-		bestScore = score
-		bestMove = move
-		fmt.Printf("info depth %d score cp %d pv %s\n", depth, bestScore, bestMove.UCI())
-	}
 
+		bestScore = score
+		if !limits.Silent {
+			nps := int(float64(s.nodes) / math.Max(0.001, time.Since(start).Seconds()))
+			fmt.Printf("info depth %d score cp %d nodes %d nps %d pv %s\n", depth, bestScore, s.nodes, nps, bestMove.UCI())
+		}
+	}
 	return bestMove
 }
 
-func searchRoot(ctx context.Context, pos Position, depth int, deadline time.Time) (int, Move, bool) {
-	moves := pos.GenerateLegalMoves()
-	if len(moves) == 0 {
-		return terminalScore(pos, depth), Move{From: -1, To: -1}, true
+func (s *Searcher) searchRoot(ctx context.Context, pos *Position, depth, alpha, beta int, deadline time.Time) (int, Move, bool) {
+	var legal MoveList
+	pos.generateLegalMovesTo(&legal, false)
+	if legal.count == 0 {
+		return terminalScore(*pos, depth), Move{From: -1, To: -1}, true
 	}
+	ttMove, _ := s.probeMove(pos.hash)
+	s.orderMoves(&legal, ttMove, 0, pos.sideToMove)
 
-	best := moves[0]
-	bestScore := math.MinInt
-	alpha, beta := -mateScore, mateScore
-
-	for _, m := range moves {
-		if searchStopped(ctx, deadline) {
-			return bestScore, best, false
+	bestMove := legal.moves[0]
+	bestScore := -mateScore
+	origAlpha := alpha
+	for i := 0; i < legal.count; i++ {
+		if s.shouldStop(ctx, deadline) {
+			return bestScore, bestMove, false
 		}
+		m := legal.moves[i]
 		undo := pos.MakeMove(m)
-		score, complete := alphaBeta(ctx, &pos, depth-1, -beta, -alpha, deadline)
+		s.pushHash(pos.hash)
+		var score int
+		var complete bool
+		if i == 0 {
+			score, complete = s.alphaBeta(ctx, pos, depth-1, -beta, -alpha, 1, true, deadline)
+			score = -score
+		} else {
+			score, complete = s.alphaBeta(ctx, pos, depth-1, -alpha-1, -alpha, 1, true, deadline)
+			score = -score
+			if complete && score > alpha && score < beta {
+				score, complete = s.alphaBeta(ctx, pos, depth-1, -beta, -alpha, 1, true, deadline)
+				score = -score
+			}
+		}
+		s.popHash()
 		pos.UndoMove(m, undo)
 		if !complete {
-			return bestScore, best, false
+			return bestScore, bestMove, false
 		}
-		score = -score
 		if score > bestScore {
 			bestScore = score
-			best = m
+			bestMove = m
 		}
 		if score > alpha {
 			alpha = score
-		}
-	}
-
-	return bestScore, best, true
-}
-
-func alphaBeta(ctx context.Context, pos *Position, depth int, alpha, beta int, deadline time.Time) (int, bool) {
-	if searchStopped(ctx, deadline) {
-		return 0, false
-	}
-	if depth == 0 {
-		return evaluate(*pos), true
-	}
-
-	moves := pos.GenerateLegalMoves()
-	if len(moves) == 0 {
-		return terminalScore(*pos, depth), true
-	}
-
-	best := math.MinInt
-	for _, m := range moves {
-		undo := pos.MakeMove(m)
-		score, complete := alphaBeta(ctx, pos, depth-1, -beta, -alpha, deadline)
-		pos.UndoMove(m, undo)
-		if !complete {
-			return 0, false
-		}
-		score = -score
-		if score > best {
-			best = score
-		}
-		if best > alpha {
-			alpha = best
 		}
 		if alpha >= beta {
 			break
 		}
 	}
-	return best, true
+	s.storeTT(pos.hash, depth, bestScore, bestMove, boundType(bestScore, origAlpha, beta))
+	return bestScore, bestMove, true
+}
+
+func (s *Searcher) alphaBeta(ctx context.Context, pos *Position, depth, alpha, beta, ply int, allowNull bool, deadline time.Time) (int, bool) {
+	s.nodes++
+	if s.nodes&2047 == 0 && s.shouldStop(ctx, deadline) {
+		return 0, false
+	}
+	if ply >= maxPly-1 {
+		return evaluate(*pos), true
+	}
+
+	if pos.halfmove >= 100 || s.isRepetition(pos.hash) {
+		return 0, true
+	}
+	inCheck := pos.InCheck(pos.sideToMove)
+	if depth <= 0 {
+		return s.quiescence(ctx, pos, alpha, beta, ply, deadline)
+	}
+
+	origAlpha := alpha
+	ttMove := Move{}
+	if score, ok, move := s.probeTT(pos.hash, depth, alpha, beta, ply); ok {
+		return score, true
+	} else {
+		ttMove = move
+	}
+
+	staticEval := evaluate(*pos)
+	if !inCheck && depth <= 2 {
+		margin := 100 + depth*80
+		if staticEval-margin >= beta {
+			return staticEval, true
+		}
+		if depth == 1 && staticEval+120 <= alpha {
+			return staticEval, true
+		}
+	}
+
+	if allowNull && depth >= 3 && !inCheck && hasNonPawnMaterial(*pos, pos.sideToMove) {
+		u := pos.MakeNullMove()
+		s.pushHash(pos.hash)
+		nullScore, complete := s.alphaBeta(ctx, pos, depth-1-2, -beta, -beta+1, ply+1, false, deadline)
+		s.popHash()
+		pos.UndoNullMove(u)
+		if !complete {
+			return 0, false
+		}
+		nullScore = -nullScore
+		if nullScore >= beta {
+			return nullScore, true
+		}
+	}
+
+	var legal MoveList
+	pos.generateLegalMovesTo(&legal, false)
+	if legal.count == 0 {
+		return terminalScore(*pos, depth), true
+	}
+	s.orderMoves(&legal, ttMove, ply, pos.sideToMove)
+
+	bestScore := -mateScore
+	bestMove := legal.moves[0]
+	for i := 0; i < legal.count; i++ {
+		m := legal.moves[i]
+		undo := pos.MakeMove(m)
+		s.pushHash(pos.hash)
+		reduction := 0
+		if depth >= 3 && i >= 4 && !inCheck && m.Captured == 0 && m.Promo == 0 {
+			reduction = 1
+		}
+		var score int
+		var complete bool
+		if i == 0 {
+			score, complete = s.alphaBeta(ctx, pos, depth-1, -beta, -alpha, ply+1, true, deadline)
+			score = -score
+		} else {
+			score, complete = s.alphaBeta(ctx, pos, depth-1-reduction, -alpha-1, -alpha, ply+1, true, deadline)
+			score = -score
+			if complete && score > alpha {
+				score, complete = s.alphaBeta(ctx, pos, depth-1, -beta, -alpha, ply+1, true, deadline)
+				score = -score
+			}
+		}
+		s.popHash()
+		pos.UndoMove(m, undo)
+		if !complete {
+			return 0, false
+		}
+		if score > bestScore {
+			bestScore = score
+			bestMove = m
+		}
+		if score > alpha {
+			alpha = score
+		}
+		if alpha >= beta {
+			if m.Captured == 0 && !m.EnPassant {
+				s.killers[ply][1] = s.killers[ply][0]
+				s.killers[ply][0] = m
+				s.bumpHistory(pos.sideToMove, m, depth)
+			}
+			break
+		}
+	}
+	s.storeTT(pos.hash, depth, bestScore, bestMove, boundType(bestScore, origAlpha, beta))
+	return bestScore, true
+}
+
+func (s *Searcher) quiescence(ctx context.Context, pos *Position, alpha, beta, ply int, deadline time.Time) (int, bool) {
+	s.nodes++
+	if s.nodes&2047 == 0 && s.shouldStop(ctx, deadline) {
+		return 0, false
+	}
+	standPat := evaluate(*pos)
+	if standPat >= beta {
+		return standPat, true
+	}
+	if standPat > alpha {
+		alpha = standPat
+	}
+
+	var captures MoveList
+	pos.generateLegalMovesTo(&captures, true)
+	if captures.count == 0 {
+		return standPat, true
+	}
+	s.orderCaptures(&captures)
+
+	for i := 0; i < captures.count; i++ {
+		m := captures.moves[i]
+		seeMargin := pieceValues[abs(m.Captured)] + 120
+		if m.Captured == 0 || standPat+seeMargin < alpha {
+			continue
+		}
+		undo := pos.MakeMove(m)
+		s.pushHash(pos.hash)
+		score, complete := s.quiescence(ctx, pos, -beta, -alpha, ply+1, deadline)
+		s.popHash()
+		pos.UndoMove(m, undo)
+		if !complete {
+			return 0, false
+		}
+		score = -score
+		if score >= beta {
+			return score, true
+		}
+		if score > alpha {
+			alpha = score
+		}
+	}
+	return alpha, true
 }
 
 func terminalScore(pos Position, depth int) int {
@@ -1020,6 +1394,270 @@ func searchStopped(ctx context.Context, deadline time.Time) bool {
 	default:
 		return false
 	}
+}
+
+func (s *Searcher) shouldStop(ctx context.Context, deadline time.Time) bool {
+	return searchStopped(ctx, deadline)
+}
+
+func computeDeadline(side int, limits SearchLimits) time.Time {
+	if limits.MoveTime > 0 {
+		return time.Now().Add(limits.MoveTime)
+	}
+	if limits.Infinite {
+		return time.Time{}
+	}
+	remaining := limits.WTime
+	if side == black {
+		remaining = limits.BTime
+	}
+	if remaining <= 0 {
+		return time.Time{}
+	}
+	budget := remaining / 30
+	if budget < 50*time.Millisecond {
+		budget = 50 * time.Millisecond
+	}
+	if budget > 3*time.Second {
+		budget = 3 * time.Second
+	}
+	return time.Now().Add(budget)
+}
+
+func (s *Searcher) pushHash(hash uint64) {
+	if s.repCount < len(s.repeat) {
+		s.repeat[s.repCount] = hash
+		s.repCount++
+	}
+}
+
+func (s *Searcher) popHash() {
+	if s.repCount > 0 {
+		s.repCount--
+	}
+}
+
+func (s *Searcher) isRepetition(hash uint64) bool {
+	for i := s.repCount - 2; i >= 0; i -= 2 {
+		if s.repeat[i] == hash {
+			return true
+		}
+	}
+	return false
+}
+
+func ttIndex(hash uint64, size int) int {
+	return int(hash) & (size - 1)
+}
+
+func (s *Searcher) probeTT(hash uint64, depth, alpha, beta, ply int) (int, bool, Move) {
+	entry := s.tt[ttIndex(hash, len(s.tt))]
+	if entry.key != hash {
+		return 0, false, Move{}
+	}
+	score := entry.score
+	if score > mateScore-128 {
+		score -= ply
+	} else if score < -mateScore+128 {
+		score += ply
+	}
+	if int(entry.depth) >= depth {
+		switch entry.flag {
+		case ttFlagExact:
+			return score, true, entry.move
+		case ttFlagLower:
+			if score >= beta {
+				return score, true, entry.move
+			}
+		case ttFlagUpper:
+			if score <= alpha {
+				return score, true, entry.move
+			}
+		}
+	}
+	return 0, false, entry.move
+}
+
+func (s *Searcher) probeMove(hash uint64) (Move, bool) {
+	entry := s.tt[ttIndex(hash, len(s.tt))]
+	if entry.key != hash {
+		return Move{}, false
+	}
+	return entry.move, true
+}
+
+func (s *Searcher) storeTT(hash uint64, depth, score int, move Move, flag uint8) {
+	idx := ttIndex(hash, len(s.tt))
+	entry := &s.tt[idx]
+	if score > mateScore-128 {
+		score += 1
+	} else if score < -mateScore+128 {
+		score -= 1
+	}
+	if entry.key != hash || int(entry.depth) <= depth || entry.age != s.age {
+		*entry = TTEntry{
+			key:   hash,
+			move:  move,
+			score: score,
+			depth: int8(depth),
+			flag:  flag,
+			age:   s.age,
+		}
+	}
+}
+
+func boundType(score, alpha, beta int) uint8 {
+	if score <= alpha {
+		return ttFlagUpper
+	}
+	if score >= beta {
+		return ttFlagLower
+	}
+	return ttFlagExact
+}
+
+func (s *Searcher) orderMoves(moves *MoveList, ttMove Move, ply int, side int) {
+	scores := [256]int{}
+	if ply < 0 {
+		ply = 0
+	}
+	sideIdx := 0
+	if side == black {
+		sideIdx = 1
+	}
+	for i := 0; i < moves.count; i++ {
+		m := moves.moves[i]
+		score := 0
+		if sameMove(m, ttMove) {
+			score += 2_000_000
+		}
+		if m.Captured != 0 {
+			score += 500_000 + 16*pieceValues[abs(m.Captured)]
+		} else {
+			if sameMove(m, s.killers[ply][0]) {
+				score += 90_000
+			} else if sameMove(m, s.killers[ply][1]) {
+				score += 80_000
+			}
+			score += s.history[sideIdx][m.From][m.To]
+		}
+		scores[i] = score
+	}
+	for i := 0; i < moves.count-1; i++ {
+		best := i
+		for j := i + 1; j < moves.count; j++ {
+			if scores[j] > scores[best] {
+				best = j
+			}
+		}
+		if best != i {
+			moves.moves[i], moves.moves[best] = moves.moves[best], moves.moves[i]
+			scores[i], scores[best] = scores[best], scores[i]
+		}
+	}
+}
+
+func (s *Searcher) orderCaptures(moves *MoveList) {
+	scores := [256]int{}
+	for i := 0; i < moves.count; i++ {
+		m := moves.moves[i]
+		attacker := pawn
+		if m.Promo != 0 {
+			attacker = m.Promo
+		}
+		scores[i] = 16*pieceValues[abs(m.Captured)] - pieceValues[attacker]
+	}
+	for i := 0; i < moves.count-1; i++ {
+		best := i
+		for j := i + 1; j < moves.count; j++ {
+			if scores[j] > scores[best] {
+				best = j
+			}
+		}
+		if best != i {
+			moves.moves[i], moves.moves[best] = moves.moves[best], moves.moves[i]
+			scores[i], scores[best] = scores[best], scores[i]
+		}
+	}
+}
+
+func (s *Searcher) bumpHistory(side int, m Move, depth int) {
+	sideIdx := 0
+	if side == black {
+		sideIdx = 1
+	}
+	cur := s.history[sideIdx][m.From][m.To]
+	cur += depth * depth
+	if cur > maxHistoryScore {
+		cur = maxHistoryScore
+	}
+	s.history[sideIdx][m.From][m.To] = cur
+}
+
+func sameMove(a, b Move) bool {
+	return a.From == b.From && a.To == b.To && a.Promo == b.Promo && a.EnPassant == b.EnPassant && a.Castle == b.Castle
+}
+
+func hasNonPawnMaterial(pos Position, side int) bool {
+	for _, piece := range pos.board {
+		if piece == empty || colorOf(piece) != side {
+			continue
+		}
+		pt := abs(piece)
+		if pt != pawn && pt != king {
+			return true
+		}
+	}
+	return false
+}
+
+func (p Position) computeHash() uint64 {
+	var h uint64
+	for sq, piece := range p.board {
+		if piece == empty {
+			continue
+		}
+		h ^= zobristPiece[pieceToHashIndex(piece)][sq]
+	}
+	h ^= zobristCastling[p.castlingRights]
+	h ^= zobristEPFile[epFileIndex(p.epSquare)]
+	if p.sideToMove == black {
+		h ^= zobristSide
+	}
+	return h
+}
+
+func pieceToHashIndex(piece int) int {
+	if piece > 0 {
+		return piece - 1
+	}
+	return 6 + (-piece - 1)
+}
+
+func epFileIndex(epSquare int) int {
+	if epSquare < 0 || epSquare >= 64 {
+		return 0
+	}
+	return (epSquare % 8) + 1
+}
+
+func perft(pos *Position, depth int) int64 {
+	if depth == 0 {
+		return 1
+	}
+	var moves MoveList
+	pos.generateLegalMovesTo(&moves, false)
+	if depth == 1 {
+		return int64(moves.count)
+	}
+	var total int64
+	for i := 0; i < moves.count; i++ {
+		m := moves.moves[i]
+		u := pos.MakeMove(m)
+		total += perft(pos, depth-1)
+		pos.UndoMove(m, u)
+	}
+	return total
 }
 
 func parseUCIMove(moveStr string, pos Position) (Move, bool) {
