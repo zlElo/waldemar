@@ -173,7 +173,7 @@ func (e *Engine) handleCommand(line string) bool {
 	switch fields[0] {
 	case "uci":
 		fmt.Println("id name Waldemar")
-		fmt.Println("id author Copilot")
+		fmt.Println("id author zlElo")
 		fmt.Println("uciok")
 	case "isready":
 		fmt.Println("readyok")
