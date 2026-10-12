@@ -156,6 +156,9 @@ func main() {
 			break
 		}
 	}
+	if err := scanner.Err(); err != nil {
+		fmt.Fprintln(os.Stderr, "input error:", err)
+	}
 
 	engine.stopSearch()
 	engine.wg.Wait()
