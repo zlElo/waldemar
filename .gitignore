@@ -221,6 +221,8 @@ __marimo__/
 
 # engine files
 waldemar
+converter.py
+book.wbf
 
 # macos
 .DS_Store
