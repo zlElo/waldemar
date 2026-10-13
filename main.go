@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -56,6 +57,8 @@ type Undo struct {
 	fullmove       int
 	hash           uint64
 	kingSq         [2]int
+	bitboards      [2][7]uint64
+	eval           int
 }
 
 type Position struct {
@@ -67,6 +70,9 @@ type Position struct {
 	fullmove       int
 	hash           uint64
 	kingSq         [2]int
+	// bitboards are maintained incrementally for fast occupancy/attack tests.
+	bitboards [2][7]uint64
+	eval      int
 }
 
 type SearchLimits struct {
@@ -75,15 +81,19 @@ type SearchLimits struct {
 	Infinite bool
 	WTime    time.Duration
 	BTime    time.Duration
+	WInc     time.Duration
+	BInc     time.Duration
 	Silent   bool
+	Threads  int
 }
 
 type Engine struct {
-	mu     sync.Mutex
-	pos    Position
-	cancel context.CancelFunc
-	busy   bool
-	wg     sync.WaitGroup
+	mu      sync.Mutex
+	pos     Position
+	cancel  context.CancelFunc
+	busy    bool
+	wg      sync.WaitGroup
+	threads int
 }
 
 type MoveList struct {
@@ -109,17 +119,25 @@ type TTEntry struct {
 	age   uint8
 }
 
-type Searcher struct {
-	tt       []TTEntry
-	age      uint8
-	nodes    uint64
-	history  [2][64][64]int
-	killers  [maxPly][2]Move
-	repeat   [maxPly + 256]uint64
-	repCount int
+type sharedTT struct {
+	mu         sync.RWMutex
+	entries    []TTEntry
+	generation uint8
 }
 
-var globalSearcher = newSearcher(1 << 20)
+type Searcher struct {
+	table        *sharedTT
+	age          uint8
+	nodes        uint64
+	history      [2][64][64]int
+	continuation [2][64][64]int
+	killers      [maxPly][2]Move
+	prevMove     [maxPly]Move
+	repeat       [maxPly + 256]uint64
+	repCount     int
+	lastScore    int
+	lastDepth    int
+}
 
 var (
 	knightOffsets = [8]int{17, 15, 10, 6, -17, -15, -10, -6}
@@ -137,6 +155,9 @@ var (
 	kingCount     [64]int
 	pawnAttacks   [2][64][2]int
 	pawnCount     [2][64]int
+	knightMask    [64]uint64
+	kingMask      [64]uint64
+	pawnMask      [2][64]uint64
 
 	zobristPiece    [12][64]uint64
 	zobristCastling [16]uint64
@@ -217,6 +238,7 @@ func initAttackTables() {
 			if inBoard(to) && sameKnightPattern(sq, to) {
 				knightAttacks[sq][knightCount[sq]] = to
 				knightCount[sq]++
+				knightMask[sq] |= uint64(1) << to
 			}
 		}
 		for _, off := range kingOffsets {
@@ -224,24 +246,29 @@ func initAttackTables() {
 			if inBoard(to) && sameKingPattern(sq, to) {
 				kingAttacks[sq][kingCount[sq]] = to
 				kingCount[sq]++
+				kingMask[sq] |= uint64(1) << to
 			}
 		}
 		file := sq % 8
-		if file > 0 {
+		if file > 0 && inBoard(sq+7) {
 			pawnAttacks[0][sq][pawnCount[0][sq]] = sq + 7
 			pawnCount[0][sq]++
+			pawnMask[0][sq] |= uint64(1) << (sq + 7)
 		}
-		if file < 7 {
+		if file < 7 && inBoard(sq+9) {
 			pawnAttacks[0][sq][pawnCount[0][sq]] = sq + 9
 			pawnCount[0][sq]++
+			pawnMask[0][sq] |= uint64(1) << (sq + 9)
 		}
-		if file > 0 {
+		if file > 0 && inBoard(sq-9) {
 			pawnAttacks[1][sq][pawnCount[1][sq]] = sq - 9
 			pawnCount[1][sq]++
+			pawnMask[1][sq] |= uint64(1) << (sq - 9)
 		}
-		if file < 7 {
+		if file < 7 && inBoard(sq-7) {
 			pawnAttacks[1][sq][pawnCount[1][sq]] = sq - 7
 			pawnCount[1][sq]++
+			pawnMask[1][sq] |= uint64(1) << (sq - 7)
 		}
 	}
 }
@@ -268,7 +295,7 @@ func initZobrist() {
 	zobristSide = next()
 }
 
-func newSearcher(ttSize int) *Searcher {
+func newSharedTT(ttSize int) *sharedTT {
 	if ttSize < 1 {
 		ttSize = 1 << 20
 	}
@@ -277,11 +304,28 @@ func newSearcher(ttSize int) *Searcher {
 	for size < ttSize {
 		size <<= 1
 	}
-	return &Searcher{tt: make([]TTEntry, size)}
+	return &sharedTT{entries: make([]TTEntry, size)}
+}
+
+func newSearcher(table *sharedTT) *Searcher {
+	table.mu.Lock()
+	if table.generation == 0 {
+		table.generation = 1
+	}
+	age := table.generation
+	table.mu.Unlock()
+	return &Searcher{table: table, age: age}
 }
 
 func main() {
-	engine := &Engine{pos: NewStartPosition()}
+	threads := runtime.NumCPU()
+	if threads < 1 {
+		threads = 1
+	}
+	if threads > 128 {
+		threads = 128
+	}
+	engine := &Engine{pos: NewStartPosition(), threads: threads}
 	scanner := bufio.NewScanner(os.Stdin)
 
 	for scanner.Scan() {
@@ -311,6 +355,7 @@ func (e *Engine) handleCommand(line string) bool {
 	case "uci":
 		fmt.Println("id name Waldemar")
 		fmt.Println("id author zlElo")
+		fmt.Printf("option name Threads type spin default %d min 1 max 128\n", e.threads)
 		fmt.Println("uciok")
 	case "isready":
 		fmt.Println("readyok")
@@ -326,6 +371,8 @@ func (e *Engine) handleCommand(line string) bool {
 		if err := e.applyPosition(fields[1:]); err != nil {
 			fmt.Fprintf(os.Stderr, "position error: %v\n", err)
 		}
+	case "setoption":
+		e.setOption(fields[1:])
 	case "go":
 		limits := parseGo(fields[1:])
 		e.startSearch(limits)
@@ -384,6 +431,7 @@ func parseGo(fields []string) SearchLimits {
 				if v, err := strconv.Atoi(fields[i+1]); err == nil && v > 0 {
 					limits.Depth = v
 				}
+
 				i++
 			}
 		case "movetime":
@@ -410,9 +458,58 @@ func parseGo(fields []string) SearchLimits {
 				}
 				i++
 			}
+		case "winc":
+			if i+1 < len(fields) {
+				if v, err := strconv.Atoi(fields[i+1]); err == nil && v >= 0 {
+					limits.WInc = time.Duration(v) * time.Millisecond
+				}
+				i++
+			}
+		case "binc":
+			if i+1 < len(fields) {
+				if v, err := strconv.Atoi(fields[i+1]); err == nil && v >= 0 {
+					limits.BInc = time.Duration(v) * time.Millisecond
+				}
+				i++
+			}
 		}
 	}
 	return limits
+}
+
+func (e *Engine) setOption(fields []string) {
+	if len(fields) < 4 || !strings.EqualFold(fields[0], "name") {
+		return
+	}
+	valueIndex := -1
+	for i, field := range fields {
+		if strings.EqualFold(field, "value") {
+			valueIndex = i
+			break
+		}
+	}
+	if valueIndex < 2 || valueIndex+1 >= len(fields) {
+		return
+	}
+	if !strings.EqualFold(strings.Join(fields[1:valueIndex], " "), "threads") {
+		return
+	}
+	value, err := strconv.Atoi(strings.TrimSpace(fields[valueIndex+1]))
+	if err != nil {
+		return
+	}
+	if value < 1 {
+		value = 1
+	}
+	if value > 128 {
+		value = 128
+	}
+	e.stopSearch()
+	e.wg.Wait()
+	e.mu.Lock()
+	e.threads = value
+	e.mu.Unlock()
+	fmt.Printf("info string Threads set to %d\n", value)
 }
 
 func (e *Engine) startSearch(l SearchLimits) {
@@ -420,7 +517,11 @@ func (e *Engine) startSearch(l SearchLimits) {
 
 	e.mu.Lock()
 	pos := e.pos.Clone()
+	threads := e.threads
 	e.mu.Unlock()
+	if l.Threads < 1 {
+		l.Threads = threads
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	e.mu.Lock()
@@ -489,6 +590,7 @@ func NewPositionFromFEN(fen string) (Position, error) {
 				return p, fmt.Errorf("invalid fen piece")
 			}
 			p.board[sq] = piece
+			p.addPieceState(piece, sq)
 			if piece == king {
 				p.kingSq[0] = sq
 			} else if piece == -king {
@@ -546,6 +648,32 @@ func NewPositionFromFEN(fen string) (Position, error) {
 	return p, nil
 }
 
+func (p *Position) addPieceState(piece, sq int) {
+	if piece == empty {
+		return
+	}
+	color := 0
+	if piece < 0 {
+		color = 1
+	}
+	pt := abs(piece)
+	p.bitboards[color][pt] |= uint64(1) << sq
+	p.eval += colorOf(piece) * (pieceValues[pt] + pieceSquare(pt, sq, colorOf(piece)))
+}
+
+func (p *Position) removePieceState(piece, sq int) {
+	if piece == empty {
+		return
+	}
+	color := 0
+	if piece < 0 {
+		color = 1
+	}
+	pt := abs(piece)
+	p.bitboards[color][pt] &^= uint64(1) << sq
+	p.eval -= colorOf(piece) * (pieceValues[pt] + pieceSquare(pt, sq, colorOf(piece)))
+}
+
 func fenRuneToPiece(ch rune) int {
 	switch ch {
 	case 'P':
@@ -590,6 +718,8 @@ func (p *Position) MakeMove(m Move) Undo {
 		fullmove:       p.fullmove,
 		hash:           p.hash,
 		kingSq:         p.kingSq,
+		bitboards:      p.bitboards,
+		eval:           p.eval,
 	}
 	piece := p.board[m.From]
 	movingType := abs(piece)
@@ -607,6 +737,7 @@ func (p *Position) MakeMove(m Move) Undo {
 	p.hash ^= zobristCastling[p.castlingRights]
 	p.hash ^= zobristEPFile[epFileIndex(undo.epSquare)]
 	p.hash ^= zobristPiece[pieceToHashIndex(piece)][m.From]
+	p.removePieceState(piece, m.From)
 	p.board[m.From] = empty
 
 	if m.EnPassant {
@@ -614,6 +745,7 @@ func (p *Position) MakeMove(m Move) Undo {
 			capSq := m.To - 8
 			undo.captured = p.board[capSq]
 			p.hash ^= zobristPiece[pieceToHashIndex(undo.captured)][capSq]
+			p.removePieceState(undo.captured, capSq)
 			p.board[capSq] = empty
 		} else {
 			capSq := m.To + 8
@@ -623,29 +755,38 @@ func (p *Position) MakeMove(m Move) Undo {
 		}
 	} else if undo.captured != empty {
 		p.hash ^= zobristPiece[pieceToHashIndex(undo.captured)][m.To]
+		p.removePieceState(undo.captured, m.To)
 	}
 
 	if m.Castle {
 		switch m.To {
 		case 6:
 			p.hash ^= zobristPiece[pieceToHashIndex(p.board[7])][7]
+			p.removePieceState(p.board[7], 7)
 			p.board[5] = p.board[7]
 			p.board[7] = empty
+			p.addPieceState(p.board[5], 5)
 			p.hash ^= zobristPiece[pieceToHashIndex(p.board[5])][5]
 		case 2:
 			p.hash ^= zobristPiece[pieceToHashIndex(p.board[0])][0]
+			p.removePieceState(p.board[0], 0)
 			p.board[3] = p.board[0]
 			p.board[0] = empty
+			p.addPieceState(p.board[3], 3)
 			p.hash ^= zobristPiece[pieceToHashIndex(p.board[3])][3]
 		case 62:
 			p.hash ^= zobristPiece[pieceToHashIndex(p.board[63])][63]
+			p.removePieceState(p.board[63], 63)
 			p.board[61] = p.board[63]
 			p.board[63] = empty
+			p.addPieceState(p.board[61], 61)
 			p.hash ^= zobristPiece[pieceToHashIndex(p.board[61])][61]
 		case 58:
 			p.hash ^= zobristPiece[pieceToHashIndex(p.board[56])][56]
+			p.removePieceState(p.board[56], 56)
 			p.board[59] = p.board[56]
 			p.board[56] = empty
+			p.addPieceState(p.board[59], 59)
 			p.hash ^= zobristPiece[pieceToHashIndex(p.board[59])][59]
 		}
 	}
@@ -658,6 +799,7 @@ func (p *Position) MakeMove(m Move) Undo {
 		}
 	}
 	p.board[m.To] = piece
+	p.addPieceState(piece, m.To)
 	p.hash ^= zobristPiece[pieceToHashIndex(piece)][m.To]
 
 	if movingType == pawn && abs(m.To-m.From) == 16 {
@@ -692,6 +834,8 @@ func (p *Position) UndoMove(m Move, u Undo) {
 	p.fullmove = u.fullmove
 	p.hash = u.hash
 	p.kingSq = u.kingSq
+	p.bitboards = u.bitboards
+	p.eval = u.eval
 
 	piece := p.board[m.To]
 	if m.Promo != 0 {
@@ -987,25 +1131,23 @@ func (p Position) InCheck(color int) bool {
 }
 
 func (p Position) squareAttacked(sq int, byColor int) bool {
+	idx := 0
+	if byColor == black {
+		idx = 1
+	}
+	target := uint64(1) << sq
+	if p.bitboards[idx][knight]&knightMask[sq] != 0 ||
+		p.bitboards[idx][king]&kingMask[sq] != 0 {
+		return true
+	}
 	if byColor == white {
-		for i := 0; i < pawnCount[1][sq]; i++ {
-			from := pawnAttacks[1][sq][i]
-			if inBoard(from) && p.board[from] == pawn {
-				return true
-			}
+		if target&((p.bitboards[idx][pawn]<<7)&^uint64(0x8080808080808080)|
+			(p.bitboards[idx][pawn]<<9)&^uint64(0x0101010101010101)) != 0 {
+			return true
 		}
 	} else {
-		for i := 0; i < pawnCount[0][sq]; i++ {
-			from := pawnAttacks[0][sq][i]
-			if inBoard(from) && p.board[from] == -pawn {
-				return true
-			}
-		}
-	}
-
-	for i := 0; i < knightCount[sq]; i++ {
-		from := knightAttacks[sq][i]
-		if p.board[from] == byColor*knight {
+		if target&((p.bitboards[idx][pawn]>>7)&^uint64(0x0101010101010101)|
+			(p.bitboards[idx][pawn]>>9)&^uint64(0x8080808080808080)) != 0 {
 			return true
 		}
 	}
@@ -1047,20 +1189,58 @@ func (p Position) squareAttacked(sq int, byColor int) bool {
 		}
 	}
 
-	for i := 0; i < kingCount[sq]; i++ {
-		from := kingAttacks[sq][i]
-		if p.board[from] == byColor*king {
-			return true
-		}
-	}
 	return false
 }
 
 func SearchBestMove(ctx context.Context, pos Position, limits SearchLimits) Move {
-	return globalSearcher.searchBestMove(ctx, pos, limits)
+	if limits.Threads < 1 {
+		limits.Threads = 1
+	}
+	if !limits.Silent {
+		fmt.Printf("info string Lazy SMP workers %d\n", limits.Threads)
+	}
+	table := newSharedTT(1 << 20)
+	table.mu.Lock()
+	table.generation++
+	if table.generation == 0 {
+		table.generation = 1
+	}
+	table.mu.Unlock()
+	if limits.Threads == 1 {
+		return newSearcher(table).searchBestMoveSingle(ctx, pos, limits)
+	}
+
+	type result struct {
+		move  Move
+		score int
+		depth int
+	}
+	results := make(chan result, limits.Threads)
+	var workers sync.WaitGroup
+	for worker := 0; worker < limits.Threads; worker++ {
+		workers.Add(1)
+		go func(worker int) {
+			defer workers.Done()
+			workerLimits := limits
+			workerLimits.Silent = workerLimits.Silent || worker != 0
+			searcher := newSearcher(table)
+			move := searcher.searchBestMoveSingle(ctx, pos, workerLimits)
+			results <- result{move: move, score: searcher.lastScore, depth: searcher.lastDepth}
+		}(worker)
+	}
+	workers.Wait()
+	close(results)
+	best := result{move: Move{From: -1, To: -1}}
+	for result := range results {
+		if result.move.From >= 0 &&
+			(result.depth > best.depth || (result.depth == best.depth && result.score > best.score)) {
+			best = result
+		}
+	}
+	return best.move
 }
 
-func (s *Searcher) searchBestMove(ctx context.Context, pos Position, limits SearchLimits) Move {
+func (s *Searcher) searchBestMoveSingle(ctx context.Context, pos Position, limits SearchLimits) Move {
 	var rootMoves MoveList
 	pos.generateLegalMovesTo(&rootMoves, false)
 	if rootMoves.count == 0 {
@@ -1073,7 +1253,11 @@ func (s *Searcher) searchBestMove(ctx context.Context, pos Position, limits Sear
 	}
 	deadline := computeDeadline(pos.sideToMove, limits)
 	s.nodes = 0
-	s.age++
+	// The generation is assigned when the worker is created; retaining it for
+	// the whole iterative search avoids evicting useful entries from siblings.
+	for i := range s.prevMove {
+		s.prevMove[i].To = -1
+	}
 	s.repCount = 0
 	s.repeat[s.repCount] = pos.hash
 	s.repCount++
@@ -1117,6 +1301,8 @@ func (s *Searcher) searchBestMove(ctx context.Context, pos Position, limits Sear
 		}
 
 		bestScore = score
+		s.lastScore = bestScore
+		s.lastDepth = depth
 		if !limits.Silent {
 			nps := int(float64(s.nodes) / math.Max(0.001, time.Since(start).Seconds()))
 			fmt.Printf("info depth %d score cp %d nodes %d nps %d pv %s\n", depth, bestScore, s.nodes, nps, bestMove.UCI())
@@ -1147,9 +1333,11 @@ func (s *Searcher) searchRoot(ctx context.Context, pos *Position, depth, alpha, 
 		var score int
 		var complete bool
 		if i == 0 {
+			s.prevMove[1] = m
 			score, complete = s.alphaBeta(ctx, pos, depth-1, -beta, -alpha, 1, true, deadline)
 			score = -score
 		} else {
+			s.prevMove[1] = m
 			score, complete = s.alphaBeta(ctx, pos, depth-1, -alpha-1, -alpha, 1, true, deadline)
 			score = -score
 			if complete && score > alpha && score < beta {
@@ -1248,9 +1436,11 @@ func (s *Searcher) alphaBeta(ctx context.Context, pos *Position, depth, alpha, b
 		var score int
 		var complete bool
 		if i == 0 {
+			s.prevMove[ply+1] = m
 			score, complete = s.alphaBeta(ctx, pos, depth-1, -beta, -alpha, ply+1, true, deadline)
 			score = -score
 		} else {
+			s.prevMove[ply+1] = m
 			score, complete = s.alphaBeta(ctx, pos, depth-1-reduction, -alpha-1, -alpha, ply+1, true, deadline)
 			score = -score
 			if complete && score > alpha {
@@ -1275,6 +1465,17 @@ func (s *Searcher) alphaBeta(ctx context.Context, pos *Position, depth, alpha, b
 				s.killers[ply][1] = s.killers[ply][0]
 				s.killers[ply][0] = m
 				s.bumpHistory(pos.sideToMove, m, depth)
+				prev := s.prevMove[ply]
+				if prev.To >= 0 {
+					sideIdx := 0
+					if pos.sideToMove == black {
+						sideIdx = 1
+					}
+					s.continuation[sideIdx][prev.To][m.To] += depth * depth
+					if s.continuation[sideIdx][prev.To][m.To] > maxHistoryScore {
+						s.continuation[sideIdx][prev.To][m.To] = maxHistoryScore
+					}
+				}
 			}
 			break
 		}
@@ -1336,17 +1537,7 @@ func terminalScore(pos Position, depth int) int {
 }
 
 func evaluate(pos Position) int {
-	score := 0
-	for sq, piece := range pos.board {
-		if piece == empty {
-			continue
-		}
-		color := colorOf(piece)
-		pt := abs(piece)
-		v := pieceValues[pt]
-		ps := pieceSquare(pt, sq, color)
-		score += color * (v + ps)
-	}
+	score := pos.eval
 	if pos.sideToMove == white {
 		return score
 	}
@@ -1414,12 +1605,22 @@ func computeDeadline(side int, limits SearchLimits) time.Time {
 	if remaining <= 0 {
 		return time.Time{}
 	}
-	budget := remaining / 30
-	if budget < 50*time.Millisecond {
-		budget = 50 * time.Millisecond
+	increment := limits.WInc
+	if side == black {
+		increment = limits.BInc
 	}
-	if budget > 3*time.Second {
-		budget = 3 * time.Second
+	// Use a larger share for normal clocks, while reserving a small safety
+	// margin so a slow iteration cannot forfeit on the next move.
+	budget := remaining/16 + increment*3/4
+	maxBudget := remaining / 2
+	if budget > maxBudget {
+		budget = maxBudget
+	}
+	if budget < 50*time.Millisecond {
+		budget = remaining / 2
+	}
+	if budget > remaining-50*time.Millisecond && remaining > 100*time.Millisecond {
+		budget = remaining - 50*time.Millisecond
 	}
 	return time.Now().Add(budget)
 }
@@ -1451,7 +1652,9 @@ func ttIndex(hash uint64, size int) int {
 }
 
 func (s *Searcher) probeTT(hash uint64, depth, alpha, beta, ply int) (int, bool, Move) {
-	entry := s.tt[ttIndex(hash, len(s.tt))]
+	s.table.mu.RLock()
+	entry := s.table.entries[ttIndex(hash, len(s.table.entries))]
+	s.table.mu.RUnlock()
 	if entry.key != hash {
 		return 0, false, Move{}
 	}
@@ -1479,7 +1682,9 @@ func (s *Searcher) probeTT(hash uint64, depth, alpha, beta, ply int) (int, bool,
 }
 
 func (s *Searcher) probeMove(hash uint64) (Move, bool) {
-	entry := s.tt[ttIndex(hash, len(s.tt))]
+	s.table.mu.RLock()
+	entry := s.table.entries[ttIndex(hash, len(s.table.entries))]
+	s.table.mu.RUnlock()
 	if entry.key != hash {
 		return Move{}, false
 	}
@@ -1487,8 +1692,10 @@ func (s *Searcher) probeMove(hash uint64) (Move, bool) {
 }
 
 func (s *Searcher) storeTT(hash uint64, depth, score int, move Move, flag uint8) {
-	idx := ttIndex(hash, len(s.tt))
-	entry := &s.tt[idx]
+	s.table.mu.Lock()
+	defer s.table.mu.Unlock()
+	idx := ttIndex(hash, len(s.table.entries))
+	entry := &s.table.entries[idx]
 	if score > mateScore-128 {
 		score += 1
 	} else if score < -mateScore+128 {
@@ -1540,6 +1747,10 @@ func (s *Searcher) orderMoves(moves *MoveList, ttMove Move, ply int, side int) {
 				score += 80_000
 			}
 			score += s.history[sideIdx][m.From][m.To]
+			prev := s.prevMove[ply]
+			if prev.To >= 0 {
+				score += s.continuation[sideIdx][prev.To][m.To]
+			}
 		}
 		scores[i] = score
 	}

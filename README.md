@@ -36,25 +36,9 @@ Implemented core UCI commands:
 - `isready` → `readyok`
 - `ucinewgame`
 - `position startpos` / `position fen ...` with optional `moves ...`
-- `go infinite`, `go movetime <ms>`, `go depth <n>`, `go wtime <ms> btime <ms>`
+- `setoption name Threads value <n>` to select the fixed number of search workers
+- `go infinite`, `go movetime <ms>`, `go depth <n>`, `go wtime <ms> btime <ms> winc <ms> binc <ms>`
 - `stop`
 - `quit`
 
 Engine returns `bestmove <move>` and emits simple `info depth ...` lines during completed iterative search depths.
-
-## Architecture (brief)
-
-- **Move generation**: Full legal move generation from pseudo-legal moves, including castling, en passant, and promotions.
-- **Search**: Iterative deepening alpha-beta (negamax style), with depth/time controls and cancellation support.
-- **Evaluation**: Material balance plus piece-square tables.
-- **Game state**: FEN parser, incremental make/undo move logic, check/checkmate/stalemate handling.
-
-## Quick CLI check
-
-```bash
-printf 'uci\nisready\nposition startpos\ngo depth 3\nquit\n' | ./waldemar
-```
-
-## GUI usage
-
-Add the built binary to any UCI GUI (Cute Chess, Arena, etc.) as a new UCI engine.
