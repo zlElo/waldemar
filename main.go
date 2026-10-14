@@ -642,7 +642,6 @@ func (b *Book) getMove(hash uint64, pos *Position) (Move, bool) {
 // ---------------------------------------------------------------------------
 
 func main() {
-	rand.Seed(time.Now().UnixNano())
 	threads := runtime.NumCPU()
 	if threads < 1 {
 		threads = 1
@@ -665,13 +664,15 @@ func main() {
 	scanner := bufio.NewScanner(os.Stdin)
 	scanner.Buffer(make([]byte, 1<<20), 1<<20)
 
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" {
-			continue
-		}
-		if engine.handleCommand(line) {
-			break
+	if scanner != nil {
+		for scanner.Scan() {
+			line := strings.TrimSpace(scanner.Text())
+			if line == "" {
+				continue
+			}
+			if engine.handleCommand(line) {
+				break
+			}
 		}
 	}
 	engine.stopSearch()
@@ -895,11 +896,9 @@ func (e *Engine) startSearch(l SearchLimits) {
 	if useBook {
 		fmt.Printf("info string book probe hash=%016x\n", pos.hash)
 		if m, ok := book.getMove(pos.hash, &pos); ok {
-			fmt.Println("info string book move")
-			fmt.Printf("bestmove %s\n", m.UCI())
+			fmt.Printf("used book move: bestmove %s\n", m.UCI())
 			return
 		}
-		fmt.Println("info string book miss")
 	} else {
 		fmt.Println("info string book disabled or not loaded")
 	}
@@ -979,9 +978,10 @@ func NewPositionFromFEN(fen string) (Position, error) {
 			}
 			p.board[sq] = piece
 			p.addPiece(piece, sq)
-			if piece == king {
+			switch piece {
+			case king:
 				p.kingSq[whiteIdx] = sq
-			} else if piece == -king {
+			case -king:
 				p.kingSq[blackIdx] = sq
 			}
 			file++
@@ -1561,13 +1561,6 @@ func (p *Position) squareAttacked(sq int, byColor int) bool {
 		}
 	}
 	return false
-}
-
-func (p *Position) givesCheck(m Move) bool {
-	u := p.MakeMove(m)
-	inChk := p.inCheck(p.sideToMove)
-	p.UndoMove(m, u)
-	return inChk
 }
 
 // ---------------------------------------------------------------------------
@@ -2439,25 +2432,6 @@ func epFileIndex(ep int) int {
 		return 0
 	}
 	return (ep % 8) + 1
-}
-
-func perft(pos *Position, depth int) int64 {
-	if depth == 0 {
-		return 1
-	}
-	var moves MoveList
-	pos.generateLegalTo(&moves, false)
-	if depth == 1 {
-		return int64(moves.count)
-	}
-	var total int64
-	for i := 0; i < moves.count; i++ {
-		m := moves.moves[i]
-		u := pos.MakeMove(m)
-		total += perft(pos, depth-1)
-		pos.UndoMove(m, u)
-	}
-	return total
 }
 
 func parseUCIMove(moveStr string, pos *Position) (Move, bool) {
